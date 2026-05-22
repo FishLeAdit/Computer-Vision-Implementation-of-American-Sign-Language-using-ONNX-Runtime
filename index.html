@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>Handtrack - American English Sign Lang</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none;
+        }
+
+        body {
+            background: #000;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Segoe UI', 'Poppins', system-ui, -apple-system, sans-serif;
+        }
+
+        #canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ccf4ff;
+            font-size: 1.3rem;
+            font-weight: 500;
+            background: rgba(0, 0, 0, 0.65);
+            backdrop-filter: blur(8px);
+            padding: 0.8rem 1.6rem;
+            border-radius: 48px;
+            letter-spacing: 0.5px;
+            pointer-events: none;
+            z-index: 20;
+            white-space: nowrap;
+            font-family: monospace;
+            box-shadow: 0 0 15px rgba(0, 255, 200, 0.3);
+            border: 1px solid rgba(0, 255, 200, 0.4);
+            transition: opacity 0.3s ease;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="loading">LOADING...</div>
+    <canvas id="canvas"></canvas>
+
+    <!-- MediaPipe core libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <script>
+        (function () {
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            const loadingDiv = document.getElementById('loading');
+
+            function hideLoading() {
+                if (!loadingDiv || loadingDiv.style.display === 'none') return;
+                loadingDiv.style.opacity = '0';
+                setTimeout(() => { loadingDiv.style.display = 'none'; }, 300);
+            }
+
+            function setLoadingMessage(msg, color = null) {
+                if (!loadingDiv) return;
+                loadingDiv.innerHTML = msg;
+                if (color) loadingDiv.style.color = color;
+            }
+
+            function resizeCanvas() {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+            }
+
+            window.addEventListener('resize', resizeCanvas);
+            resizeCanvas();
+
+            function drawCameraFrame(imageElement) {
+                if (!imageElement || imageElement.width === 0 || imageElement.height === 0) return false;
+
+                const canvasW = canvas.width;
+                const canvasH = canvas.height;
+                const imgAspect = imageElement.width / imageElement.height;
+                const canvasAspect = canvasW / canvasH;
+
+                let drawWidth, drawHeight, offsetX, offsetY;
+
+                if (canvasAspect > imgAspect) {
+                    drawWidth = canvasW;
+                    drawHeight = canvasW / imgAspect;
+                    offsetX = 0;
+                    offsetY = (canvasH - drawHeight) / 2;
+                } else {
+                    drawHeight = canvasH;
+                    drawWidth = canvasH * imgAspect;
+                    offsetX = (canvasW - drawWidth) / 2;
+                    offsetY = 0;
+                }
+
+                ctx.save();
+                ctx.translate(canvasW, 0);
+                ctx.scale(-1, 1);
+                ctx.drawImage(imageElement, offsetX, offsetY, drawWidth, drawHeight);
+                ctx.restore();
+                return true;
+            }
+
+            function drawHandSkeleton(landmarks) {
+                if (!landmarks || landmarks.length === 0) return;
+
+                const mirroredLm = landmarks.map(lm => ({ x: 1 - lm.x, y: lm.y, z: lm.z }));
+
+                drawConnectors(ctx, mirroredLm, HAND_CONNECTIONS, {
+                    color: '#2effb0',
+                    lineWidth: 2.3,
+                    shadowBlur: 5,
+                    shadowColor: '#1effbc'
+                });
+                drawLandmarks(ctx, mirroredLm, {
+                    color: '#ffd966',
+                    lineWidth: 1.2,
+                    radius: 3.2,
+                    fillColor: '#ffb347'
+                });
+            }
+
+            function onHandResults(results) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                if (results.image && results.image.width > 0) {
+                    drawCameraFrame(results.image);
+                } else {
+                    ctx.fillStyle = '#000000';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                }
+
+                if (results.multiHandLandmarks) {
+                    for (const landmarks of results.multiHandLandmarks) {
+                        drawHandSkeleton(landmarks);
+                    }
+                }
+
+                hideLoading();
+            }
+
+            let handsInstance = null;
+            let cameraInstance = null;
+
+            function initHandTracking() {
+                try {
+                    handsInstance = new Hands({
+                        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+                    });
+
+                    handsInstance.setOptions({
+                        maxNumHands: 2,
+                        modelComplexity: 1,
+                        minDetectionConfidence: 0.3,
+                        minTrackingConfidence: 0.3
+                    });
+
+                    handsInstance.onResults(onHandResults);
+
+                    const videoElement = document.createElement('video');
+                    cameraInstance = new Camera(videoElement, {
+                        onFrame: async () => {
+                            if (handsInstance) await handsInstance.send({ image: videoElement });
+                        },
+                        width: { ideal: 1920 },
+                        height: { ideal: 720 }
+                    });
+
+                    cameraInstance.start()
+                        .then(() => {
+                            console.log('[HandTracking] Camera stream active');
+                            hideLoading();
+                        })
+                        .catch((err) => {
+                            console.error('Camera error:', err);
+                            setLoadingMessage('CAMERA ERROR: ' + (err.message || 'Permission denied'), '#ffaa88');
+                            if (loadingDiv) loadingDiv.style.backgroundColor = 'rgba(0,0,0,0.85)';
+                        });
+                } catch (error) {
+                    console.error('MediaPipe init error:', error);
+                    setLoadingMessage('FAILED TO LOAD HAND MODEL - REFRESH PLEASE');
+                    if (loadingDiv) loadingDiv.style.backgroundColor = '#aa2222cc';
+                }
+            }
+
+            window.addEventListener('beforeunload', () => {
+                cameraInstance?.stop();
+                handsInstance?.close();
+            });
+
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', initHandTracking);
+            } else {
+                initHandTracking();
+            }
+        })();
+    </script>
+</body>
+
+</html>
