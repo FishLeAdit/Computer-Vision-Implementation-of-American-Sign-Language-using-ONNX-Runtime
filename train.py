@@ -1,115 +1,122 @@
-# pip install pandas numpy scikit-learn skl2onnx onnxruntime
+# pip install pandas numpy tensorflow tensorflowjs
+
 import json
 import numpy as np
 import pandas as pd
+import tensorflow as tf
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from skl2onnx import convert_sklearn
-from skl2onnx.common.data_types import FloatTensorType
-import onnxruntime as ort
 
-CSV_PATH = "asl_raw_2026-05-22T17-33-53.csv" 
+CSV_PATH = "asl_raw_2026-05-22T17-33-53.csv"  
+
 df = pd.read_csv(CSV_PATH)
 
-# Landmarks into (N, 21, 3) arrays
 coord_cols = []
 for i in range(21):
     coord_cols += [f"x{i}", f"y{i}", f"z{i}"]
 
-landmarks = df[coord_cols].values.astype(np.float32)  # shape (N, 63)
-landmarks = landmarks.reshape(-1, 21, 3)               # shape (N, 21, 3)
-
+landmarks = df[coord_cols].values.astype(np.float32)
+landmarks = landmarks.reshape(-1, 21, 3)
 labels = df["letter"].values
-hands = df["hand"].values if "hand" in df.columns else np.array(["right"] * len(df))
 
-# Canonicalize== Mirroring Left Hand for Right Hand Use
-for i in range(len(landmarks)):
-    if hands[i] == "left":
-        landmarks[i, :, 0] = 1.0 - landmarks[i, :, 0]
-
-# Feature engineering == Translation & Scale Invariance
+# Preprocessing
 features = []
-
 for lm in landmarks:
-    # Wrist is origin
+    # Translate
     lm = lm - lm[0]
-
-    # Wrist 2 mid finger xd
-    scale = np.linalg.norm(lm[9])
-    if scale < 1e-6:
-        scale = 1.0  # fallback
-
+    # Scale
+    scale = np.linalg.norm(lm[9]) or 1.0
     lm = lm / scale
-
-    # Drop wrist and flatten vector
-    vec = lm[1:].flatten() 
-    features.append(vec)
+    # Flatten
+    features.append(lm[1:].flatten())
 
 X = np.vstack(features).astype(np.float32)
-y = labels
 
-# Train / Test split
+# Encode labels
+classes = sorted(np.unique(labels))
+class_to_idx = {c: i for i, c in enumerate(classes)}
+y_int = np.array([class_to_idx[c] for c in labels], dtype=np.int32)
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
-)
-
-print(f"Training samples: {len(X_train)}")
-print(f"Test samples:     {len(X_test)}")
-print(f"Features per sample: {X.shape[1]}")
-
-# Train Random Forest
-clf = RandomForestClassifier(
-    n_estimators=300,
-    max_depth=None,
-    min_samples_split=2,
-    random_state=42,
-    class_weight="balanced",
-    n_jobs=-1,
-)
-clf.fit(X_train, y_train)
-
-# Eval
-y_pred = clf.predict(X_test)
-acc = accuracy_score(y_test, y_pred)
-
-print("\n" + "=" * 50)
-print(f"Test Accuracy: {acc:.4f}")
-print("=" * 50)
-print("\nClassification Report:")
-print(classification_report(y_test, y_pred))
-
-# Show confused pairs
-print("\nConfusion Matrix (rows=true, cols=pred):")
-cm = confusion_matrix(y_test, y_pred, labels=clf.classes_)
-cm_df = pd.DataFrame(cm, index=clf.classes_, columns=clf.classes_)
-print(cm_df)
-
-# Browser inference onyx export
-initial_type = [("float_input", FloatTensorType([None, 60]))]
-onnx_model = convert_sklearn(
-    clf,
-    initial_types=initial_type,
-    target_opset=12,
-    options={id(clf): {"zipmap": False}},  # output raw probabilities
-)
-
-onnx_path = "asl_sign_model.onnx"
-with open(onnx_path, "wb") as f:
-    f.write(onnx_model.SerializeToString())
-print(f"\n✅ ONNX model saved: {onnx_path}")
-
-# Onyx runtime sanity check
-sess = ort.InferenceSession(onnx_path)
-input_name = sess.get_inputs()[0].name
-pred_onnx = sess.run(None, {input_name: X_test[:5]})[0]
-print("\nONNX Runtime sanity check (first 5 predictions):")
-print("  Sklearn :", y_pred[:5])
-print("  ONNX    :", pred_onnx)
-
-# Save label mapping for JavaScript frntend
-label_map = {i: cls for i, cls in enumerate(clf.classes_)}
+# Save label map
+label_map = {i: c for i, c in enumerate(classes)}
 with open("label_map.json", "w") as f:
     json.dump(label_map, f)
-print("✅ Label map saved: label_map.json")
+print("✅ Saved label_map.json")
+
+# Augmentation
+def augment(batch, noise_std=0.02, scale_jitter=0.05):
+    noise = np.random.normal(0, noise_std, batch.shape)
+    scale = 1.0 + np.random.uniform(-scale_jitter, scale_jitter, size=(batch.shape[0], 1))
+    return (batch * scale) + noise
+
+X_aug = [X]
+y_aug = [y_int]
+for _ in range(3):
+    X_aug.append(augment(X))
+    y_aug.append(y_int)
+
+X = np.vstack(X_aug)
+y_int = np.hstack(y_aug)
+print(f"✅ Augmented dataset: {len(X)} samples")
+
+# Split dataset
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_int, test_size=0.2, random_state=42, stratify=y_int
+)
+
+# Model
+model = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(60,)),
+    tf.keras.layers.Dense(128, activation='relu'),
+    tf.keras.layers.Dropout(0.3),
+    tf.keras.layers.Dense(64, activation='relu'),
+    tf.keras.layers.Dense(26, activation='softmax')
+])
+
+model.compile(
+    optimizer='adam',
+    loss='sparse_categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+# Early stopping
+es = tf.keras.callbacks.EarlyStopping(
+    monitor='val_loss', patience=10, restore_best_weights=True
+)
+
+model.fit(
+    X_train, y_train,
+    validation_split=0.2,
+    epochs=200,
+    batch_size=32,
+    callbacks=[es],
+    verbose=1
+)
+
+# Evaluate
+loss, acc = model.evaluate(X_test, y_test, verbose=0)
+print(f"\n✅ Test accuracy: {acc:.4f}")
+
+# Export
+import json
+import os
+
+os.makedirs('asl_tfjs_model', exist_ok=True)
+
+with open('asl_tfjs_model/model_arch.json', 'w') as f:
+    f.write(model.to_json())
+
+weights = model.get_weights()
+manifest = []
+for i, w in enumerate(weights):
+    fname = f'weight_{i}.bin'
+    w.astype(np.float32).tofile(f'asl_tfjs_model/{fname}')
+    manifest.append({
+        "name": fname,
+        "shape": list(w.shape),
+        "dtype": "float32"
+    })
+
+with open('asl_tfjs_model/weights_manifest.json', 'w') as f:
+    json.dump(manifest, f)
+
+print("Saved TF.js compatible files to ./asl_tfjs_model/")

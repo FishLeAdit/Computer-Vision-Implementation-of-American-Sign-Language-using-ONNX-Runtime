@@ -1,225 +1,302 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
-    <title>Handtrack - American English Sign Lang</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            user-select: none;
-        }
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>ASL Two-Hand Tracker | TF.js</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; }
+    body { background: #000; overflow: hidden; font-family: 'Segoe UI', monospace; }
+    canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
 
-        body {
-            background: #000;
-            overflow: hidden;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            font-family: 'Segoe UI', 'Poppins', system-ui, -apple-system, sans-serif;
-        }
-
-        #canvas {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            display: block;
-        }
-
-        #loading {
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            color: #ccf4ff;
-            font-size: 1.3rem;
-            font-weight: 500;
-            background: rgba(0, 0, 0, 0.65);
-            backdrop-filter: blur(8px);
-            padding: 0.8rem 1.6rem;
-            border-radius: 48px;
-            letter-spacing: 0.5px;
-            pointer-events: none;
-            z-index: 20;
-            white-space: nowrap;
-            font-family: monospace;
-            box-shadow: 0 0 15px rgba(0, 255, 200, 0.3);
-            border: 1px solid rgba(0, 255, 200, 0.4);
-            transition: opacity 0.3s ease;
-        }
-    </style>
+    .ui {
+      position: absolute; inset: 0; z-index: 10; pointer-events: none;
+      display: flex; flex-direction: column; justify-content: center; align-items: center;
+    }
+    #loading {
+      color: #ccf4ff; font-size: 1.4rem; font-weight: 500;
+      background: rgba(0,0,0,0.65); backdrop-filter: blur(8px);
+      padding: 1rem 2rem; border-radius: 48px;
+      border: 1px solid rgba(0,255,200,0.4);
+      box-shadow: 0 0 15px rgba(0,255,200,0.3);
+      transition: opacity 0.3s;
+    }
+    .hint {
+      position: absolute; bottom: 20px; left: 0; right: 0; text-align: center;
+      color: rgba(200,220,255,0.6); font-size: 0.85rem;
+    }
+  </style>
 </head>
-
 <body>
 
-    <div id="loading">LOADING...</div>
-    <canvas id="canvas"></canvas>
+  <div class="ui">
+    <div id="loading">Loading camera & model…</div>
+  </div>
+  <div class="hint">Show one or both hands • Letters appear only when the model is confident</div>
+  <canvas id="canvas"></canvas>
 
-    <!-- MediaPipe core libraries -->
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"
-        crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"
-        crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <!-- TensorFlow.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <!-- MediaPipe -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
 
-    <script>
-        (function () {
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
-            const loadingDiv = document.getElementById('loading');
+  <script>
+    (function () {
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+      const loading = document.getElementById('loading');
 
-            function hideLoading() {
-                if (!loadingDiv || loadingDiv.style.display === 'none') return;
-                loadingDiv.style.opacity = '0';
-                setTimeout(() => { loadingDiv.style.display = 'none'; }, 300);
+      let model = null;
+      let labelMap = {};
+      let modelReady = false;
+
+      // Temporal smoothing per detected hand (index 0 or 1)
+      const handHistories = [[], []];
+      const HISTORY_SIZE = 10;
+      const VOTE_THRESHOLD = 7;
+      const CONFIDENCE_THRESHOLD = 0.85;
+      const lastStableLetter = [null, null];
+      const lastWristPos = [{x:0,y:0}, {x:0,y:0}];
+
+      function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+      window.addEventListener('resize', resize);
+      resize();
+
+      // Load model
+      async function initModel() {
+        try {
+            // Load manifest
+            const manifestResp = await fetch('./asl_tfjs_model/weights_manifest.json');
+            const manifest = await manifestResp.json();
+
+            // Load weights
+            const weightTensors = [];
+            for (const entry of manifest) {
+            const buf = await fetch(`./asl_tfjs_model/${entry.name}`).then(r => r.arrayBuffer());
+            const arr = new Float32Array(buf);
+            weightTensors.push(tf.tensor(arr, entry.shape));
             }
 
-            function setLoadingMessage(msg, color = null) {
-                if (!loadingDiv) return;
-                loadingDiv.innerHTML = msg;
-                if (color) loadingDiv.style.color = color;
-            }
+            // Model
+            model = tf.sequential();
+            model.add(tf.layers.dense({inputShape: [60], units: 128, activation: 'relu'}));
+            model.add(tf.layers.dense({units: 64, activation: 'relu'}));
+            model.add(tf.layers.dense({units: 26, activation: 'softmax'}));
 
-            function resizeCanvas() {
-                canvas.width = window.innerWidth;
-                canvas.height = window.innerHeight;
-            }
+            // Set weights
+            model.setWeights(weightTensors);
 
-            window.addEventListener('resize', resizeCanvas);
-            resizeCanvas();
+            // Load label map
+            const resp = await fetch('./label_map.json');
+            labelMap = await resp.json();
+            modelReady = true;
+            console.log('[ASL] TF.js model loaded from manual weights');
+        } catch (e) {
+            console.error('[ASL] Model load failed:', e);
+            loading.textContent = '⚠️ Model failed to load. Check console.';
+        }
+        }
 
-            function drawCameraFrame(imageElement) {
-                if (!imageElement || imageElement.width === 0 || imageElement.height === 0) return false;
+      // Preprocessing
+      function extractFeatures(landmarks) {
+        const lm = landmarks.map(p => [p.x, p.y, p.z]);
 
-                const canvasW = canvas.width;
-                const canvasH = canvas.height;
-                const imgAspect = imageElement.width / imageElement.height;
-                const canvasAspect = canvasW / canvasH;
+        // Translate
+        const wx = lm[0][0], wy = lm[0][1], wz = lm[0][2];
+        for (let i = 0; i < 21; i++) {
+          lm[i][0] -= wx;
+          lm[i][1] -= wy;
+          lm[i][2] -= wz;
+        }
 
-                let drawWidth, drawHeight, offsetX, offsetY;
+        // Scale
+        const scale = Math.sqrt(
+          lm[9][0]*lm[9][0] + lm[9][1]*lm[9][1] + lm[9][2]*lm[9][2]
+        ) || 1.0;
 
-                if (canvasAspect > imgAspect) {
-                    drawWidth = canvasW;
-                    drawHeight = canvasW / imgAspect;
-                    offsetX = 0;
-                    offsetY = (canvasH - drawHeight) / 2;
-                } else {
-                    drawHeight = canvasH;
-                    drawWidth = canvasH * imgAspect;
-                    offsetX = (canvasW - drawWidth) / 2;
-                    offsetY = 0;
+        for (let i = 0; i < 21; i++) {
+          lm[i][0] /= scale;
+          lm[i][1] /= scale;
+          lm[i][2] /= scale;
+        }
+
+        // Flatten
+        const vec = new Float32Array(60);
+        let vi = 0;
+        for (let i = 1; i < 21; i++) {
+          vec[vi++] = lm[i][0];
+          vec[vi++] = lm[i][1];
+          vec[vi++] = lm[i][2];
+        }
+        return vec;
+      }
+
+      // Temporal smoothing
+      function smoothLetter(handIdx, letter) {
+        const hist = handHistories[handIdx];
+        if (letter !== null) hist.push(letter);
+        if (hist.length > HISTORY_SIZE) hist.shift();
+
+        const counts = {};
+        let best = null, bestCount = 0;
+        for (const l of hist) {
+          if (l === null) continue;
+          counts[l] = (counts[l] || 0) + 1;
+          if (counts[l] > bestCount) {
+            bestCount = counts[l];
+            best = l;
+          }
+        }
+        return (bestCount >= VOTE_THRESHOLD) ? best : null;
+      }
+
+      // Drawing helpers
+      function drawCam(img) {
+        if (!img || img.width === 0) return false;
+        const w = canvas.width, h = canvas.height;
+        const a = img.width / img.height, ca = w / h;
+        let dw, dh, dx, dy;
+        if (ca > a) { dw = w; dh = w / a; dx = 0; dy = (h - dh) / 2; }
+        else { dh = h; dw = h * a; dx = (w - dw) / 2; dy = 0; }
+        ctx.save();
+        ctx.translate(w, 0); ctx.scale(-1, 1);
+        ctx.drawImage(img, dx, dy, dw, dh);
+        ctx.restore();
+        return true;
+      }
+
+      function drawSkeleton(landmarks) {
+        const m = landmarks.map(p => ({ x: 1 - p.x, y: p.y, z: p.z }));
+        drawConnectors(ctx, m, HAND_CONNECTIONS, {
+          color: '#2effb0', lineWidth: 2.3, shadowBlur: 5, shadowColor: '#1effbc'
+        });
+        drawLandmarks(ctx, m, {
+          color: '#ffd966', lineWidth: 1.2, radius: 3.2, fillColor: '#ffb347'
+        });
+      }
+
+      function drawLabel(letter, x, y) {
+        ctx.save();
+        ctx.font = 'bold 52px "Segoe UI", monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        ctx.fillStyle = '#ffffff';
+        ctx.shadowColor = '#0affd0';
+        ctx.shadowBlur = 20;
+        ctx.fillText(letter, x, y - 20);
+        ctx.restore();
+      }
+
+      // MediaPipe results handler
+      async function onResults(results) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (results.image) drawCam(results.image);
+        else { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height); }
+
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+          for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+            const lm = results.multiHandLandmarks[i];
+
+            // Draw wireframe
+            drawSkeleton(lm);
+
+            // Store wrist position for label placement
+            const wx = (1 - lm[0].x) * canvas.width;
+            const wy = lm[0].y * canvas.height;
+            lastWristPos[i] = { x: wx, y: wy };
+
+            // Run TF.js inference
+            if (modelReady && model) {
+              const features = extractFeatures(lm);
+              const input = tf.tensor2d([features], [1, 60]);
+
+              try {
+                const output = model.predict(input);
+                const probs = await output.data();  // Float32Array of 26 probabilities
+                const maxProb = Math.max(...probs);
+                const predIndex = probs.indexOf(maxProb);
+
+                // Memory cleanup (TF.js is strict about this)
+                input.dispose();
+                output.dispose();
+
+                // Only accept high-confidence predictions
+                let letter = null;
+                if (maxProb >= CONFIDENCE_THRESHOLD) {
+                  letter = labelMap[predIndex];
                 }
 
-                ctx.save();
-                ctx.translate(canvasW, 0);
-                ctx.scale(-1, 1);
-                ctx.drawImage(imageElement, offsetX, offsetY, drawWidth, drawHeight);
-                ctx.restore();
-                return true;
-            }
-
-            function drawHandSkeleton(landmarks) {
-                if (!landmarks || landmarks.length === 0) return;
-
-                const mirroredLm = landmarks.map(lm => ({ x: 1 - lm.x, y: lm.y, z: lm.z }));
-
-                drawConnectors(ctx, mirroredLm, HAND_CONNECTIONS, {
-                    color: '#2effb0',
-                    lineWidth: 2.3,
-                    shadowBlur: 5,
-                    shadowColor: '#1effbc'
-                });
-                drawLandmarks(ctx, mirroredLm, {
-                    color: '#ffd966',
-                    lineWidth: 1.2,
-                    radius: 3.2,
-                    fillColor: '#ffb347'
-                });
-            }
-
-            function onHandResults(results) {
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-                if (results.image && results.image.width > 0) {
-                    drawCameraFrame(results.image);
-                } else {
-                    ctx.fillStyle = '#000000';
-                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                if (letter) {
+                  const stable = smoothLetter(i, letter);
+                  if (stable) lastStableLetter[i] = stable;
                 }
-
-                if (results.multiHandLandmarks) {
-                    for (const landmarks of results.multiHandLandmarks) {
-                        drawHandSkeleton(landmarks);
-                    }
-                }
-
-                hideLoading();
+              } catch (e) {
+                console.error('[ASL] Inference error:', e);
+                input.dispose();
+              }
             }
+          }
 
-            let handsInstance = null;
-            let cameraInstance = null;
-
-            function initHandTracking() {
-                try {
-                    handsInstance = new Hands({
-                        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
-                    });
-
-                    handsInstance.setOptions({
-                        maxNumHands: 2,
-                        modelComplexity: 1,
-                        minDetectionConfidence: 0.3,
-                        minTrackingConfidence: 0.3
-                    });
-
-                    handsInstance.onResults(onHandResults);
-
-                    const videoElement = document.createElement('video');
-                    cameraInstance = new Camera(videoElement, {
-                        onFrame: async () => {
-                            if (handsInstance) await handsInstance.send({ image: videoElement });
-                        },
-                        width: { ideal: 1920 },
-                        height: { ideal: 720 }
-                    });
-
-                    cameraInstance.start()
-                        .then(() => {
-                            console.log('[HandTracking] Camera stream active');
-                            hideLoading();
-                        })
-                        .catch((err) => {
-                            console.error('Camera error:', err);
-                            setLoadingMessage('CAMERA ERROR: ' + (err.message || 'Permission denied'), '#ffaa88');
-                            if (loadingDiv) loadingDiv.style.backgroundColor = 'rgba(0,0,0,0.85)';
-                        });
-                } catch (error) {
-                    console.error('MediaPipe init error:', error);
-                    setLoadingMessage('FAILED TO LOAD HAND MODEL - REFRESH PLEASE');
-                    if (loadingDiv) loadingDiv.style.backgroundColor = '#aa2222cc';
-                }
+          // Draw stable labels on top of everything
+          for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+            if (lastStableLetter[i]) {
+              drawLabel(lastStableLetter[i], lastWristPos[i].x, lastWristPos[i].y);
             }
+          }
+        } else {
+          // Reset histories when hands leave frame
+          handHistories[0] = []; handHistories[1] = [];
+          lastStableLetter[0] = null; lastStableLetter[1] = null;
+        }
 
-            window.addEventListener('beforeunload', () => {
-                cameraInstance?.stop();
-                handsInstance?.close();
-            });
+        if (modelReady) {
+          loading.style.opacity = '0';
+          setTimeout(() => loading.style.display = 'none', 300);
+        }
+      }
 
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', initHandTracking);
-            } else {
-                initHandTracking();
-            }
-        })();
-    </script>
+      // Boot
+      async function init() {
+        await initModel();
+
+        const hands = new Hands({
+          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+        hands.setOptions({
+          maxNumHands: 2,
+          modelComplexity: 1,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5
+        });
+        hands.onResults(onResults);
+
+        const video = document.createElement('video');
+        const cam = new Camera(video, {
+          onFrame: async () => { await hands.send({ image: video }); },
+          width: { ideal: 1280 }, height: { ideal: 720 }
+        });
+        cam.start()
+          .then(() => { console.log('[ASL] Camera active'); })
+          .catch(err => {
+            console.error('[ASL] Camera error:', err);
+            loading.textContent = '⚠️ Camera error: ' + err.message;
+          });
+      }
+
+      window.addEventListener('beforeunload', () => {
+        if (model) model.dispose();
+      });
+
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+      } else {
+        init();
+      }
+    })();
+  </script>
 </body>
-
 </html>

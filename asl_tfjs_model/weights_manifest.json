@@ -1,0 +1,1 @@
+[{"name": "weight_0.bin", "shape": [60, 128], "dtype": "float32"}, {"name": "weight_1.bin", "shape": [128], "dtype": "float32"}, {"name": "weight_2.bin", "shape": [128, 64], "dtype": "float32"}, {"name": "weight_3.bin", "shape": [64], "dtype": "float32"}, {"name": "weight_4.bin", "shape": [64, 26], "dtype": "float32"}, {"name": "weight_5.bin", "shape": [26], "dtype": "float32"}]
