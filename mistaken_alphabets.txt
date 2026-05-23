@@ -1,6 +1,0 @@
-E = M/Z
-H = G
-M  =E
-Q = P/G
-R = K
-X = G

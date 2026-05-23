@@ -30,14 +30,12 @@
 <body>
 
   <div class="ui">
-    <div id="loading">Loading camera & model…</div>
+    <div id="loading">Loading camera and model...</div>
   </div>
-  <div class="hint">Show one or both hands • Letters appear only when the model is confident</div>
+  <div class="hint">Show one or both hands. Letters appear only when the model is confident.</div>
   <canvas id="canvas"></canvas>
 
-  <!-- TensorFlow.js -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
-  <!-- MediaPipe -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
@@ -53,7 +51,7 @@
       let labelMap = {};
       let modelReady = false;
 
-      // Temporal smoothing per detected hand (index 0 or 1)
+      // Temporal smoothing state per detected hand (index 0 or 1)
       const handHistories = [[], []];
       const HISTORY_SIZE = 10;
       const VOTE_THRESHOLD = 7;
@@ -65,76 +63,74 @@
       window.addEventListener('resize', resize);
       resize();
 
-      // Load model
       async function initModel() {
         try {
-            // Load manifest
-            const manifestResp = await fetch('./asl_tfjs_model/weights_manifest.json');
-            const manifest = await manifestResp.json();
-
-            // Load weights
-            const weightTensors = [];
-            for (const entry of manifest) {
-            const buf = await fetch(`./asl_tfjs_model/${entry.name}`).then(r => r.arrayBuffer());
-            const arr = new Float32Array(buf);
-            weightTensors.push(tf.tensor(arr, entry.shape));
-            }
-
-            // Model
-            model = tf.sequential();
-            model.add(tf.layers.dense({inputShape: [60], units: 128, activation: 'relu'}));
-            model.add(tf.layers.dense({units: 64, activation: 'relu'}));
-            model.add(tf.layers.dense({units: 26, activation: 'softmax'}));
-
-            // Set weights
-            model.setWeights(weightTensors);
-
-            // Load label map
+            model = await tf.loadLayersModel('./asl_tfjs_model/model.json');
             const resp = await fetch('./label_map.json');
             labelMap = await resp.json();
             modelReady = true;
-            console.log('[ASL] TF.js model loaded from manual weights');
+            console.log('[ASL] TF.js model loaded.');
         } catch (e) {
             console.error('[ASL] Model load failed:', e);
-            loading.textContent = '⚠️ Model failed to load. Check console.';
+            loading.textContent = 'Model failed to load. Check console.';
         }
-        }
-
-      // Preprocessing
-      function extractFeatures(landmarks) {
-        const lm = landmarks.map(p => [p.x, p.y, p.z]);
-
-        // Translate
-        const wx = lm[0][0], wy = lm[0][1], wz = lm[0][2];
-        for (let i = 0; i < 21; i++) {
-          lm[i][0] -= wx;
-          lm[i][1] -= wy;
-          lm[i][2] -= wz;
-        }
-
-        // Scale
-        const scale = Math.sqrt(
-          lm[9][0]*lm[9][0] + lm[9][1]*lm[9][1] + lm[9][2]*lm[9][2]
-        ) || 1.0;
-
-        for (let i = 0; i < 21; i++) {
-          lm[i][0] /= scale;
-          lm[i][1] /= scale;
-          lm[i][2] /= scale;
-        }
-
-        // Flatten
-        const vec = new Float32Array(60);
-        let vi = 0;
-        for (let i = 1; i < 21; i++) {
-          vec[vi++] = lm[i][0];
-          vec[vi++] = lm[i][1];
-          vec[vi++] = lm[i][2];
-        }
-        return vec;
       }
 
-      // Temporal smoothing
+      /**
+       * Extracts translation-invariant, scale-invariant, and orientation-aware
+       * features to resolve ASL structural confusions (e.g., E vs M, R vs K,
+       * H vs G, P vs Q). Must stay in sync with the Python training pipeline.
+       */
+      function extractRobustFeatures(landmarks) {
+        const wrist = landmarks[0];
+        let lmCentered = landmarks.map(p => [p.x - wrist.x, p.y - wrist.y, p.z - wrist.z]);
+
+        const mKnuckle = lmCentered[9];
+        const scale = Math.hypot(mKnuckle[0], mKnuckle[1], mKnuckle[2]) || 1.0;
+        let lmScaled = lmCentered.map(p => [p[0] / scale, p[1] / scale, p[2] / scale]);
+
+        // Structural distances capture fist tightness and finger curl (E vs M, R vs K)
+        const fingerTips = [4, 8, 12, 16, 20];
+        const knuckles = [2, 5, 9, 13, 17];
+        let distances = [];
+
+        fingerTips.forEach(tip => {
+          const p = lmScaled[tip];
+          distances.push(Math.hypot(p[0], p[1], p[2]));
+        });
+
+        for (let i = 0; i < fingerTips.length; i++) {
+          const tip = lmScaled[fingerTips[i]];
+          const knuck = lmScaled[knuckles[i]];
+          distances.push(Math.hypot(tip[0] - knuck[0], tip[1] - knuck[1], tip[2] - knuck[2]));
+        }
+
+        // Orientation vectors capture hand rotation and pitch (H vs G, P vs Q)
+        const v5_0 = [lmScaled[5][0] - lmScaled[0][0], lmScaled[5][1] - lmScaled[0][1], lmScaled[5][2] - lmScaled[0][2]];
+        const v17_0 = [lmScaled[17][0] - lmScaled[0][0], lmScaled[17][1] - lmScaled[0][1], lmScaled[17][2] - lmScaled[0][2]];
+        
+        let palmNormal = [
+          v5_0[1] * v17_0[2] - v5_0[2] * v17_0[1],
+          v5_0[2] * v17_0[0] - v5_0[0] * v17_0[2],
+          v5_0[0] * v17_0[1] - v5_0[1] * v17_0[0]
+        ];
+        const normLen = Math.hypot(palmNormal[0], palmNormal[1], palmNormal[2]) || 1.0;
+        palmNormal = palmNormal.map(v => v / normLen);
+
+        let handDirection = [lmScaled[9][0] - lmScaled[0][0], lmScaled[9][1] - lmScaled[0][1], lmScaled[9][2] - lmScaled[0][2]];
+        const dirLen = Math.hypot(handDirection[0], handDirection[1], handDirection[2]) || 1.0;
+        handDirection = handDirection.map(v => v / dirLen);
+
+        // Flatten into a single 82-item vector: 63 coords + 10 distances + 3 normal + 3 direction
+        let flatFeatures = [];
+        lmScaled.forEach(p => flatFeatures.push(...p));
+        flatFeatures.push(...distances);
+        flatFeatures.push(...palmNormal);
+        flatFeatures.push(...handDirection);
+
+        return flatFeatures;
+      }
+
       function smoothLetter(handIdx, letter) {
         const hist = handHistories[handIdx];
         if (letter !== null) hist.push(letter);
@@ -153,7 +149,6 @@
         return (bestCount >= VOTE_THRESHOLD) ? best : null;
       }
 
-      // Drawing helpers
       function drawCam(img) {
         if (!img || img.width === 0) return false;
         const w = canvas.width, h = canvas.height;
@@ -190,7 +185,6 @@
         ctx.restore();
       }
 
-      // MediaPipe results handler
       async function onResults(results) {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -201,30 +195,23 @@
           for (let i = 0; i < results.multiHandLandmarks.length; i++) {
             const lm = results.multiHandLandmarks[i];
 
-            // Draw wireframe
             drawSkeleton(lm);
 
-            // Store wrist position for label placement
             const wx = (1 - lm[0].x) * canvas.width;
             const wy = lm[0].y * canvas.height;
             lastWristPos[i] = { x: wx, y: wy };
 
-            // Run TF.js inference
+            // Run inference inside tf.tidy to prevent GPU memory leaks
             if (modelReady && model) {
-              const features = extractFeatures(lm);
-              const input = tf.tensor2d([features], [1, 60]);
+              tf.tidy(() => {
+                const features = extractRobustFeatures(lm);
+                const input = tf.tensor2d([features]);
 
-              try {
                 const output = model.predict(input);
-                const probs = await output.data();  // Float32Array of 26 probabilities
+                const probs = output.dataSync(); 
                 const maxProb = Math.max(...probs);
                 const predIndex = probs.indexOf(maxProb);
 
-                // Memory cleanup (TF.js is strict about this)
-                input.dispose();
-                output.dispose();
-
-                // Only accept high-confidence predictions
                 let letter = null;
                 if (maxProb >= CONFIDENCE_THRESHOLD) {
                   letter = labelMap[predIndex];
@@ -234,21 +221,17 @@
                   const stable = smoothLetter(i, letter);
                   if (stable) lastStableLetter[i] = stable;
                 }
-              } catch (e) {
-                console.error('[ASL] Inference error:', e);
-                input.dispose();
-              }
+              });
             }
           }
 
-          // Draw stable labels on top of everything
           for (let i = 0; i < results.multiHandLandmarks.length; i++) {
             if (lastStableLetter[i]) {
               drawLabel(lastStableLetter[i], lastWristPos[i].x, lastWristPos[i].y);
             }
           }
         } else {
-          // Reset histories when hands leave frame
+          // Reset histories when hands leave frame to avoid stale predictions
           handHistories[0] = []; handHistories[1] = [];
           lastStableLetter[0] = null; lastStableLetter[1] = null;
         }
@@ -259,7 +242,6 @@
         }
       }
 
-      // Boot
       async function init() {
         await initModel();
 
@@ -283,7 +265,7 @@
           .then(() => { console.log('[ASL] Camera active'); })
           .catch(err => {
             console.error('[ASL] Camera error:', err);
-            loading.textContent = '⚠️ Camera error: ' + err.message;
+            loading.textContent = 'Camera error: ' + err.message;
           });
       }
 
